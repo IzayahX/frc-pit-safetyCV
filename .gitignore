@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+venv/
+.venv/
+
+# IDE
+.cursor/
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Training data & violation snapshots (regenerated at runtime)
+data_collection/
+violations/
+
+# Model weights — too large for git, download separately
+# Uncomment these if you want to exclude them:
+# *.onnx
+# *.tflite
+# *.pt

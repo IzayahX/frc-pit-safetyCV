@@ -1,0 +1,8 @@
+# Laptop (webcam_test.py)
+opencv-python
+numpy
+onnxruntime
+
+# Raspberry Pi (pi_deploy.py + launcher.py)
+# Use install.sh for Pi setup, or install manually:
+#   pip install opencv-python numpy ai-edge-litert

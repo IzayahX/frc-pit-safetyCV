@@ -1,0 +1,16 @@
+[Unit]
+Description=FRC Pit Safety Monitor
+After=graphical.target
+Wants=graphical.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/pi/pit_safety
+Environment=DISPLAY=:0
+ExecStart=/home/pi/pit_safety/venv/bin/python3 launcher.py
+Restart=on-failure
+RestartSec=5
+User=pi
+
+[Install]
+WantedBy=graphical.target
