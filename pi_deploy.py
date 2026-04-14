@@ -2,8 +2,11 @@
 """
 pi_deploy.py – FRC Pit Safety Monitor (Raspberry Pi)
 
-Runs the safety glasses detection loop optimized for Pi 4/5.
-Supports picamera2 (ribbon) and USB webcams with auto-reconnect.
+Parity-focused deployment:
+- Auto-detect model input layout (NHWC/NCHW), dtype, quantization
+- Dynamically use the model's input resolution (no hardcoded imgsz)
+- Letterbox-by-default (no aspect squish) with correct box unprojection
+- Robust camera + inference error handling with clear logging
 """
 
 import cv2
@@ -14,71 +17,79 @@ import threading
 import logging
 import numpy as np
 
-# ── Logging ──────────────────────────────────────────────
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%H:%M:%S"
+    datefmt="%H:%M:%S",
 )
 logger = logging.getLogger("pit_safety")
 
+
 # ── Config (pulled from environment, set by launcher.py) ─
-CONFIRM_FRAMES  = int(os.environ.get("CONFIRM_FRAMES", 8))
-MIN_CONF        = float(os.environ.get("MIN_CONF", 0.70))
+CONFIRM_FRAMES = int(os.environ.get("CONFIRM_FRAMES", 8))
+MIN_CONF = float(os.environ.get("MIN_CONF", 0.70))
 CAM_RETRY_DELAY = int(os.environ.get("CAM_RETRY_DELAY", 5))
-DATA_SAVE_INT   = float(os.environ.get("DATA_SAVE_INT", 0))
+DATA_SAVE_INT = float(os.environ.get("DATA_SAVE_INT", 0))
 PROCESS_EVERY_N = int(os.environ.get("PROCESS_EVERY_N", 2))
-TFLITE_THREADS  = int(os.environ.get("TFLITE_THREADS", 2))
-MODEL_PATH      = os.environ.get("MODEL_PATH", "")
-CAMERA_INDEX    = os.environ.get("CAMERA_INDEX", "auto")
-FULLSCREEN      = os.environ.get("FULLSCREEN", "1") == "1"
-DEMO_MODE       = os.environ.get("DEMO_MODE", "1") == "1"
+TFLITE_THREADS = int(os.environ.get("TFLITE_THREADS", 2))
+MODEL_PATH = os.environ.get("MODEL_PATH", "")
+CAMERA_INDEX = os.environ.get("CAMERA_INDEX", "auto")
+FULLSCREEN = os.environ.get("FULLSCREEN", "1") == "1"
+DEMO_MODE = os.environ.get("DEMO_MODE", "1") == "1"
+RESIZE_MODE = os.environ.get("RESIZE_MODE", "letterbox").strip().lower()
+DEBUG_PREPROC = os.environ.get("DEBUG_PREPROC", "0") == "1"
 
 WIN_NAME = "FRC Pit Safety - Monitor"
 FACE_CASCADE_PATH = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
 
-# Check for picamera2 (only available on Pi OS)
+
+# ── Camera backend availability ──────────────────────────
 HAS_PICAMERA2 = False
 try:
     from picamera2 import Picamera2
+
     HAS_PICAMERA2 = True
 except ImportError:
     pass
 
 
-# ── TFLite Model Loading ────────────────────────────────
+# ── TFLite Model Loading ─────────────────────────────────
 def load_interpreter(model_path: str, num_threads: int):
     """Try multiple TFLite backends in priority order."""
     Interpreter = None
     load_delegate = None
+    backend = None
 
-    # 1) ai-edge-litert (Google's newer package)
     try:
         from ai_edge_litert.interpreter import Interpreter, load_delegate
+
+        backend = "ai-edge-litert"
     except ImportError:
         pass
 
-    # 2) tflite-runtime (classic pip package)
     if Interpreter is None:
         try:
             import importlib
+
             mod = importlib.import_module("tflite_runtime.interpreter")
             Interpreter = mod.Interpreter
             load_delegate = getattr(mod, "load_delegate", None)
+            backend = "tflite-runtime"
         except (ImportError, ModuleNotFoundError):
             pass
 
-    # 3) Full TensorFlow (heavy, but works)
     if Interpreter is None:
         try:
             import tensorflow as tf
+
             Interpreter = tf.lite.Interpreter
             load_delegate = tf.lite.experimental.load_delegate
+            backend = "tensorflow"
         except (ImportError, Exception):
             logger.error("No TFLite runtime found. Install ai-edge-litert or tflite-runtime.")
             sys.exit(1)
 
-    # Try XNNPACK for acceleration on Pi
     delegates = []
     if load_delegate:
         try:
@@ -93,47 +104,219 @@ def load_interpreter(model_path: str, num_threads: int):
         experimental_delegates=delegates or None,
     )
     interp.allocate_tensors()
+    logger.info(f"TFLite backend: {backend or 'unknown'}")
     return interp
 
 
-def infer(interp, input_idx, output_idx, is_int8, imgsz, frame_rgb, conf):
-    """Run inference and return bounding boxes [(x1,y1,x2,y2), ...]."""
-    img = cv2.resize(frame_rgb, (imgsz, imgsz))
-    if is_int8:
-        tensor = img.astype(np.uint8)[np.newaxis]
+_logged_model_io = {"done": False}
+
+
+def _input_spec(input_detail: dict):
+    shape = list(input_detail.get("shape", []))
+    dtype = input_detail.get("dtype")
+    q = input_detail.get("quantization", (0.0, 0))
+    q_scale = float(q[0]) if q and q[0] is not None else 0.0
+    q_zero = int(q[1]) if q and q[1] is not None else 0
+
+    layout = "unknown"
+    h = w = c = None
+    if len(shape) == 4 and shape[0] in (1, -1):
+        if shape[3] in (1, 3, 4) and shape[1] > 0 and shape[2] > 0:
+            layout = "NHWC"
+            h, w, c = int(shape[1]), int(shape[2]), int(shape[3])
+        elif shape[1] in (1, 3, 4) and shape[2] > 0 and shape[3] > 0:
+            layout = "NCHW"
+            c, h, w = int(shape[1]), int(shape[2]), int(shape[3])
+
+    return {
+        "shape": shape,
+        "dtype": dtype,
+        "layout": layout,
+        "h": h,
+        "w": w,
+        "c": c,
+        "q_scale": q_scale,
+        "q_zero": q_zero,
+    }
+
+
+def _letterbox(img_rgb: np.ndarray, new_w: int, new_h: int):
+    h0, w0 = img_rgb.shape[:2]
+    r = min(new_w / w0, new_h / h0)
+    new_unpad_w = int(round(w0 * r))
+    new_unpad_h = int(round(h0 * r))
+    resized = cv2.resize(img_rgb, (new_unpad_w, new_unpad_h), interpolation=cv2.INTER_LINEAR)
+    dw = new_w - new_unpad_w
+    dh = new_h - new_unpad_h
+    left = dw // 2
+    right = dw - left
+    top = dh // 2
+    bottom = dh - top
+    padded = cv2.copyMakeBorder(
+        resized, top, bottom, left, right, cv2.BORDER_CONSTANT, value=(114, 114, 114)
+    )
+    return padded, r, left, top
+
+
+def _preprocess(frame_rgb: np.ndarray, spec: dict):
+    if spec["layout"] == "unknown" or spec["h"] is None or spec["w"] is None:
+        raise ValueError(f"Unsupported model input shape/layout: {spec['shape']} layout={spec['layout']}")
+
+    in_h, in_w = spec["h"], spec["w"]
+
+    if RESIZE_MODE == "stretch":
+        img = cv2.resize(frame_rgb, (in_w, in_h), interpolation=cv2.INTER_LINEAR)
+        meta = {
+            "mode": "stretch",
+            "r": (in_w / frame_rgb.shape[1], in_h / frame_rgb.shape[0]),
+            "padx": 0,
+            "pady": 0,
+        }
     else:
+        img, r, pad_x, pad_y = _letterbox(frame_rgb, in_w, in_h)
+        meta = {"mode": "letterbox", "r": r, "padx": pad_x, "pady": pad_y}
+
+    if spec["layout"] == "NCHW":
+        img = np.transpose(img, (2, 0, 1))  # CHW
+
+    dtype = spec["dtype"]
+    q_scale = spec["q_scale"]
+    q_zero = spec["q_zero"]
+
+    if dtype == np.float32:
         tensor = (img.astype(np.float32) / 255.0)[np.newaxis]
+        meta["quant_mode"] = "float01"
+    elif dtype in (np.uint8, np.int8):
+        # scale ~1 => model likely trained in 0-255 domain; else 0-1 domain
+        if q_scale and q_scale > 0.1:
+            real = img.astype(np.float32)
+            meta["quant_mode"] = "u8255"
+        else:
+            real = img.astype(np.float32) / 255.0
+            meta["quant_mode"] = "u801"
 
-    interp.set_tensor(input_idx, tensor)
-    interp.invoke()
+        if not q_scale:
+            tensor = img.astype(dtype)[np.newaxis]
+            meta["quant_mode"] = "raw"
+        else:
+            q = np.round(real / q_scale + q_zero)
+            if dtype == np.uint8:
+                q = np.clip(q, 0, 255).astype(np.uint8)
+            else:
+                q = np.clip(q, -128, 127).astype(np.int8)
+            tensor = q[np.newaxis]
+    else:
+        raise ValueError(f"Unsupported input dtype: {dtype}")
 
-    preds = interp.get_tensor(output_idx)[0]
-    if preds.shape[0] < preds.shape[1]:
+    return tensor, meta
+
+
+def _unproject_box(x1, y1, x2, y2, meta: dict, orig_w: int, orig_h: int):
+    if meta["mode"] == "stretch":
+        sx, sy = meta["r"]
+        x1 = x1 / sx
+        x2 = x2 / sx
+        y1 = y1 / sy
+        y2 = y2 / sy
+    else:
+        r = meta["r"]
+        x1 = (x1 - meta["padx"]) / r
+        x2 = (x2 - meta["padx"]) / r
+        y1 = (y1 - meta["pady"]) / r
+        y2 = (y2 - meta["pady"]) / r
+
+    x1 = int(max(0, min(orig_w - 1, x1)))
+    x2 = int(max(0, min(orig_w - 1, x2)))
+    y1 = int(max(0, min(orig_h - 1, y1)))
+    y2 = int(max(0, min(orig_h - 1, y2)))
+    return x1, y1, x2, y2
+
+
+def infer(interp, input_detail: dict, output_detail: dict, frame_rgb: np.ndarray, conf: float):
+    """Run inference and return bounding boxes in original-frame coords."""
+    spec = _input_spec(input_detail)
+
+    if not _logged_model_io["done"]:
+        logger.info(
+            f"Model input: shape={spec['shape']} layout={spec['layout']} dtype={spec['dtype']} "
+            f"q=({spec['q_scale']},{spec['q_zero']})"
+        )
+        try:
+            out_shape = list(output_detail.get("shape", []))
+            logger.info(f"Model output: shape={out_shape} dtype={output_detail.get('dtype')}")
+        except Exception:
+            pass
+        logger.info(f"Preprocess: RESIZE_MODE={RESIZE_MODE}")
+        _logged_model_io["done"] = True
+
+    try:
+        tensor, meta = _preprocess(frame_rgb, spec)
+    except Exception as e:
+        logger.error(f"Preprocess failed: {e}")
+        return []
+
+    try:
+        interp.set_tensor(input_detail["index"], tensor)
+        interp.invoke()
+        preds = interp.get_tensor(output_detail["index"])[0]
+    except Exception as e:
+        logger.error(f"Inference failed: {e}")
+        return []
+
+    if hasattr(preds, "shape") and len(preds.shape) == 2 and preds.shape[0] < preds.shape[1]:
         preds = preds.T
 
     confs = preds[:, 4].astype(np.float32)
-    if confs.max() > 1.0:
+    if confs.size and confs.max() > 1.0:
         confs /= 255.0
 
     filtered = preds[confs >= conf]
-    h, w = frame_rgb.shape[:2]
-    sx, sy = w / imgsz, h / imgsz
+
+    orig_h, orig_w = frame_rgb.shape[:2]
+    in_h, in_w = spec["h"], spec["w"]
 
     boxes = []
     for d in filtered:
         vals = d[:4].astype(np.float32)
-        # INT8 models output pixel coords as 0-255, need to rescale
-        if vals.max() > 1.0:
-            vals /= 255.0
-            vals *= imgsz
-        cx, cy, bw, bh = vals[0] * sx, vals[1] * sy, vals[2] * sx, vals[3] * sy
-        boxes.append((int(cx - bw / 2), int(cy - bh / 2), int(cx + bw / 2), int(cy + bh / 2)))
+
+        if vals.max() <= 1.5:
+            vals[0] *= in_w
+            vals[1] *= in_h
+            vals[2] *= in_w
+            vals[3] *= in_h
+        elif vals.max() <= 255.0 and max(in_w, in_h) > 255:
+            vals = (vals / 255.0)
+            vals[0] *= in_w
+            vals[1] *= in_h
+            vals[2] *= in_w
+            vals[3] *= in_h
+
+        cx, cy, bw, bh = vals[0], vals[1], vals[2], vals[3]
+        x1 = cx - bw / 2
+        y1 = cy - bh / 2
+        x2 = cx + bw / 2
+        y2 = cy + bh / 2
+
+        x1, y1, x2, y2 = _unproject_box(x1, y1, x2, y2, meta, orig_w, orig_h)
+        boxes.append((x1, y1, x2, y2))
+
+    if DEBUG_PREPROC:
+        try:
+            os.makedirs("debug_preproc", exist_ok=True)
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            cv2.imwrite(
+                f"debug_preproc/frame_{ts}.jpg", cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+            )
+        except Exception:
+            pass
+
     return boxes
 
 
 # ── Per-Person Violation Tracker ─────────────────────────
 class TrackedPerson:
     """Tracks consecutive frames without glasses to confirm a violation."""
+
     def __init__(self):
         self.streak = 0
         self.is_safe = True
@@ -179,9 +362,6 @@ def find_working_camera():
 
 # ── Threaded Camera Buffer (auto-reconnect) ──────────────
 class CamBuffer:
-    """Continuously grabs frames in a background thread so the main
-    loop never blocks on a slow camera read."""
-
     def __init__(self, idx=0, use_picamera=None):
         self.idx = idx
         self.force_picamera = use_picamera
@@ -210,20 +390,27 @@ class CamBuffer:
                 logger.info("Camera: picamera2 (hardware accelerated)")
                 return
             except Exception as e:
-                logger.warning(f"picamera2 failed: {e}, falling back to OpenCV")
+                logger.warning(f"picamera2 init failed: {e}, falling back to OpenCV")
                 self.picam = None
 
         self._init_opencv()
 
     def _init_opencv(self):
-        if self.cap:
-            self.cap.release()
-        self.cap = cv2.VideoCapture(self.idx)
-        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-        self.use_picamera2 = False
-        logger.info(f"Camera: OpenCV VideoCapture (index {self.idx})")
+        try:
+            if self.cap:
+                self.cap.release()
+        except Exception:
+            pass
+        try:
+            self.cap = cv2.VideoCapture(self.idx)
+            self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            self.use_picamera2 = False
+            logger.info(f"Camera: OpenCV VideoCapture (index {self.idx})")
+        except Exception as e:
+            logger.error(f"Failed to init OpenCV camera (index {self.idx}): {e}")
+            self.cap = None
 
     def _loop(self):
         while self.alive:
@@ -233,15 +420,24 @@ class CamBuffer:
                     with self.lock:
                         self.ok = True
                         self.frame = frame
-                except Exception:
+                except Exception as e:
+                    logger.warning(f"picamera2 capture failed: {e}")
                     time.sleep(CAM_RETRY_DELAY)
                     self._init_cam()
             else:
-                if not self.cap or not self.cap.isOpened():
+                if not self.cap:
                     time.sleep(CAM_RETRY_DELAY)
                     self._init_opencv()
                     continue
-                ok, f = self.cap.read()
+                if not self.cap.isOpened():
+                    time.sleep(CAM_RETRY_DELAY)
+                    self._init_opencv()
+                    continue
+                try:
+                    ok, f = self.cap.read()
+                except Exception as e:
+                    logger.warning(f"OpenCV read failed: {e}")
+                    ok, f = False, None
                 with self.lock:
                     self.ok, self.frame = ok, f
                 if not ok:
@@ -268,19 +464,34 @@ class CamBuffer:
 
 
 # ── HUD Drawing ─────────────────────────────────────────
-COLOR_SAFE   = (80, 220, 0)
+COLOR_SAFE = (80, 220, 0)
 COLOR_UNSAFE = (255, 60, 0)
-COLOR_HUD    = (15, 15, 15)
-WHITE        = (255, 255, 255)
+COLOR_HUD = (15, 15, 15)
+WHITE = (255, 255, 255)
 
 
 def make_no_camera_slate(width=640, height=480):
-    """Placeholder frame shown while waiting for a camera."""
     img = np.zeros((height, width, 3), dtype=np.uint8)
-    cv2.putText(img, "NO CAMERA / RECONNECTING", (40, height // 2 - 20),
-                cv2.FONT_HERSHEY_DUPLEX, 0.9, (60, 60, 255), 2, cv2.LINE_AA)
-    cv2.putText(img, time.strftime("%H:%M:%S"), (40, height // 2 + 30),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 1, cv2.LINE_AA)
+    cv2.putText(
+        img,
+        "NO CAMERA / RECONNECTING",
+        (40, height // 2 - 20),
+        cv2.FONT_HERSHEY_DUPLEX,
+        0.9,
+        (60, 60, 255),
+        2,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        img,
+        time.strftime("%H:%M:%S"),
+        (40, height // 2 + 30),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.7,
+        (200, 200, 200),
+        1,
+        cv2.LINE_AA,
+    )
     return img
 
 
@@ -297,31 +508,57 @@ def apply_fullscreen_once(win_name, state):
 def draw_hud(frame, overall_unsafe, fps, violations, people_count, tag, data_collecting):
     h, w = frame.shape[:2]
 
-    # Status box in top-left
     cv2.rectangle(frame, (10, 10), (220, 95), COLOR_HUD, -1)
     status_txt = "PIT SECURE" if not overall_unsafe else "UNSAFE PIT"
     status_col = COLOR_SAFE if not overall_unsafe else COLOR_UNSAFE
-    cv2.putText(frame, status_txt, (22, 36), cv2.FONT_HERSHEY_DUPLEX, 0.6, status_col, 1, cv2.LINE_AA)
-    cv2.putText(frame, f"People: {people_count}", (22, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 180, 180), 1, cv2.LINE_AA)
-    cv2.putText(frame, f"Violations: {violations}", (22, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 180, 180), 1, cv2.LINE_AA)
+    cv2.putText(
+        frame, status_txt, (22, 36), cv2.FONT_HERSHEY_DUPLEX, 0.6, status_col, 1, cv2.LINE_AA
+    )
+    cv2.putText(
+        frame,
+        f"People: {people_count}",
+        (22, 58),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.45,
+        (180, 180, 180),
+        1,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        frame,
+        f"Violations: {violations}",
+        (22, 80),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.45,
+        (180, 180, 180),
+        1,
+        cv2.LINE_AA,
+    )
 
-    # FPS + engine tag in bottom-right
     info = f"{int(fps)} FPS | {tag}"
     (iw, _), _ = cv2.getTextSize(info, cv2.FONT_HERSHEY_SIMPLEX, 0.35, 1)
-    cv2.putText(frame, info, (w - iw - 10, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (110, 110, 110), 1, cv2.LINE_AA)
+    cv2.putText(
+        frame,
+        info,
+        (w - iw - 10, h - 10),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.35,
+        (110, 110, 110),
+        1,
+        cv2.LINE_AA,
+    )
 
-    # Red dot when saving training data
     if data_collecting:
         cv2.circle(frame, (w - 20, 20), 8, (0, 0, 255), -1)
-        cv2.putText(frame, "REC", (w - 55, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1, cv2.LINE_AA)
+        cv2.putText(
+            frame, "REC", (w - 55, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1, cv2.LINE_AA
+        )
 
 
-# ── Main Loop ────────────────────────────────────────────
 def main():
     if not os.environ.get("DISPLAY"):
         os.environ["DISPLAY"] = ":0"
 
-    # Auto-detect model if not specified
     model_path = MODEL_PATH
     if not model_path:
         tflite_files = [f for f in os.listdir(".") if f.endswith(".tflite")]
@@ -330,7 +567,6 @@ def main():
             sys.exit(1)
         model_path = tflite_files[0]
 
-    # Pick camera
     if CAMERA_INDEX in ("auto", ""):
         camera_idx = find_working_camera()
         if camera_idx is None:
@@ -340,7 +576,9 @@ def main():
         camera_idx = int(CAMERA_INDEX)
 
     logger.info(f"Model: {model_path}")
-    logger.info(f"Config: CONFIRM_FRAMES={CONFIRM_FRAMES}, MIN_CONF={MIN_CONF}, PROCESS_EVERY_N={PROCESS_EVERY_N}")
+    logger.info(
+        f"Config: CONFIRM_FRAMES={CONFIRM_FRAMES}, MIN_CONF={MIN_CONF}, PROCESS_EVERY_N={PROCESS_EVERY_N}, RESIZE_MODE={RESIZE_MODE}"
+    )
     logger.info(f"Camera: index {camera_idx} (-1 = Pi Camera)")
     logger.info(f"FULLSCREEN={FULLSCREEN} DEMO_MODE={DEMO_MODE}")
 
@@ -349,13 +587,9 @@ def main():
 
     face_cascade = cv2.CascadeClassifier(FACE_CASCADE_PATH)
     interp = load_interpreter(model_path, TFLITE_THREADS)
-
     in_det = interp.get_input_details()[0]
-    input_idx = in_det["index"]
-    output_idx = interp.get_output_details()[0]["index"]
-    is_int8 = in_det["dtype"] == np.uint8
-    imgsz = in_det["shape"][1]
-    model_tag = f"Pi | {'INT8' if is_int8 else 'FP32'}"
+    out_det = interp.get_output_details()[0]
+    model_tag = f"Pi | {str(in_det.get('dtype'))}"
 
     use_picam = camera_idx == -1
     cam = CamBuffer(idx=max(0, camera_idx), use_picamera=use_picam if use_picam else None)
@@ -389,7 +623,6 @@ def main():
 
         frame_count += 1
 
-        # picamera2 gives RGB, OpenCV gives BGR
         if cam.is_rgb():
             frame_rgb = frame
             frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
@@ -398,8 +631,6 @@ def main():
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
         now = time.perf_counter()
-
-        # Save raw images for training data
         if DATA_SAVE_INT > 0 and (now - last_data_t) >= DATA_SAVE_INT:
             os.makedirs("data_collection", exist_ok=True)
             ts = time.strftime("%Y%m%d_%H%M%S")
@@ -407,16 +638,14 @@ def main():
             logger.info(f"Saved training image: raw_{ts}.jpg")
             last_data_t = now
 
-        # Only run detection every N frames to save CPU
         if frame_count % PROCESS_EVERY_N == 0:
             gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
             cached_faces = face_cascade.detectMultiScale(gray, 1.2, 5, minSize=(60, 60))
-            cached_g_boxes = infer(interp, input_idx, output_idx, is_int8, imgsz, frame_rgb, MIN_CONF)
+            cached_g_boxes = infer(interp, in_det, out_det, frame_rgb, MIN_CONF)
 
         faces = cached_faces
         g_boxes = cached_g_boxes
 
-        # Match glasses detections to faces
         current_frame_unsafe = False
         active_ids = set()
 
@@ -426,7 +655,6 @@ def main():
             if fid not in tracks:
                 tracks[fid] = TrackedPerson()
 
-            # Check if any glasses bounding box center falls inside this face
             has_glasses = False
             for (gx1, gy1, gx2, gy2) in g_boxes:
                 gcx, gcy = (gx1 + gx2) / 2, (gy1 + gy2) / 2
@@ -439,15 +667,18 @@ def main():
             if not tracks[fid].is_safe:
                 current_frame_unsafe = True
                 msg = "GLASSES REQUIRED"
-                (mw, mh), _ = cv2.getTextSize(msg, cv2.FONT_HERSHEY_DUPLEX, 0.4, 1)
+                (mw, _mh), _ = cv2.getTextSize(msg, cv2.FONT_HERSHEY_DUPLEX, 0.4, 1)
                 cv2.rectangle(frame_bgr, (fx, fy - 36), (fx + mw + 10, fy - 22), col, -1)
-                cv2.putText(frame_bgr, msg, (fx + 5, fy - 24), cv2.FONT_HERSHEY_DUPLEX, 0.4, WHITE, 1, cv2.LINE_AA)
+                cv2.putText(
+                    frame_bgr, msg, (fx + 5, fy - 24), cv2.FONT_HERSHEY_DUPLEX, 0.4, WHITE, 1, cv2.LINE_AA
+                )
 
             cv2.rectangle(frame_bgr, (fx, fy), (fx + fw, fy + fh), col, 2)
             cv2.rectangle(frame_bgr, (fx, fy - 22), (fx + 45, fy), col, -1)
-            cv2.putText(frame_bgr, fid, (fx + 5, fy - 7), cv2.FONT_HERSHEY_DUPLEX, 0.45, WHITE, 1, cv2.LINE_AA)
+            cv2.putText(
+                frame_bgr, fid, (fx + 5, fy - 7), cv2.FONT_HERSHEY_DUPLEX, 0.45, WHITE, 1, cv2.LINE_AA
+            )
 
-        # New violation = first unsafe frame after a safe period
         if current_frame_unsafe and not overall_unsafe:
             violations += 1
             os.makedirs("violations", exist_ok=True)

@@ -121,6 +121,7 @@ class LauncherApp:
         self.detected_camera = None
         self._handoff_armed = False
         self._poll_scheduled = False
+        self._autosave_after_id = None
 
         self.create_widgets()
 
@@ -131,6 +132,43 @@ class LauncherApp:
             self.quit_btn.grid_remove()
 
         self.schedule_camera_poll()
+        self._setup_autosave_hooks()
+
+    # ── Autosave on change (debounced) ───────────────────
+    def _setup_autosave_hooks(self):
+        def changed(*_args):
+            self._schedule_autosave()
+
+        for var in (self.frame_skip_var, self.conf_var, self.confirm_var, self.data_enabled_var):
+            try:
+                var.trace_add("write", changed)
+            except Exception:
+                pass
+
+        def entry_changed(_event=None):
+            self._schedule_autosave()
+
+        try:
+            self.data_interval_entry.bind("<KeyRelease>", entry_changed)
+            self.data_interval_entry.bind("<FocusOut>", entry_changed)
+        except Exception:
+            pass
+
+    def _schedule_autosave(self):
+        try:
+            if self._autosave_after_id is not None:
+                self.root.after_cancel(self._autosave_after_id)
+        except Exception:
+            pass
+        self._autosave_after_id = self.root.after(250, self._autosave_now)
+
+    def _autosave_now(self):
+        self._autosave_after_id = None
+        try:
+            self.save_and_get_config()
+        except Exception:
+            # Avoid crashing the kiosk for a save failure.
+            pass
 
     # ── Camera polling ───────────────────────────────────
     def schedule_camera_poll(self):
