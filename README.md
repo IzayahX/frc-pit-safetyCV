@@ -41,7 +41,7 @@ chmod +x install.sh
 ./install.sh
 ```
 
-The installer handles everything — system packages, Python venv, auto-start on boot.
+The installer handles everything from system packages, Python venv, auto-start on boot.
 
 After install, the monitor lives at `~/pit_safety/` and launches automatically when the Pi boots to desktop.
 
@@ -81,7 +81,7 @@ Edit `config.env` or use the launcher GUI:
 
 The included model is a YOLOv8n trained on safety glasses detection. Two formats:
 
-- `best_int8.tflite` — INT8 quantized, runs on Pi at ~5-10 FPS
+- `best_int8.tflite` — INT8 quantized, runs on Pi at ~45-60 FPS
 - `best.onnx` — full precision, runs on laptop with ONNX Runtime
 
 To train your own model, collect images using the `DATA_SAVE_INT` feature, label them, and retrain with [Ultralytics YOLOv8](https://docs.ultralytics.com/).
