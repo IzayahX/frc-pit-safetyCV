@@ -1,6 +1,6 @@
 # FRC Pit Safety Monitor
 
-Real-time safety glasses detection for FIRST Robotics Competition pit areas. Uses a custom YOLOv8 model to detect whether people in the pit are wearing safety glasses and alerts when violations are found.
+Real-time safety glasses detection for FIRST Robotics Competition pit areas. Uses a custom YOLOv8 model to detect whether people in the pit are wearing safety glasses and alerts when violations are found. This system is being used by Team 8749 FamersvilleISD!
 
 Built for Raspberry Pi 4/5 with a camera module or USB webcam. Also runs on a laptop for testing.
 
