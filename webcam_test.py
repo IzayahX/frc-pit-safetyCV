@@ -96,11 +96,13 @@ def infer_tflite(interp, in_idx, out_idx, frame_rgb, imgsz, conf):
 
 # ── Per-Person Tracker ───────────────────────────────────
 class TrackedPerson:
-    def __init__(self):
+    def __init__(self, box):
         self.streak = 0
         self.is_safe = True
+        self.last_box = box  # (x1, y1, x2, y2) in frame coords
 
-    def update(self, has_glasses):
+    def update(self, has_glasses, box):
+        self.last_box = box
         if has_glasses:
             self.streak = max(0, self.streak - 1)
             if self.streak == 0:
@@ -109,6 +111,55 @@ class TrackedPerson:
             self.streak += 1
             if self.streak >= CONFIRM_FRAMES:
                 self.is_safe = False
+
+
+# ── IoU / Track Matching Helpers ─────────────────────────
+def _iou(a, b):
+    """Intersection-over-Union for two (x1, y1, x2, y2) boxes."""
+    ix1 = max(a[0], b[0])
+    iy1 = max(a[1], b[1])
+    ix2 = min(a[2], b[2])
+    iy2 = min(a[3], b[3])
+    inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+    if inter == 0:
+        return 0.0
+    area_a = max(0, a[2] - a[0]) * max(0, a[3] - a[1])
+    area_b = max(0, b[2] - b[0]) * max(0, b[3] - b[1])
+    union = area_a + area_b - inter
+    return inter / union if union > 0 else 0.0
+
+
+def match_tracks(tracks, faces, iou_thresh=0.30):
+    """
+    Spatially match current face detections to existing track IDs by IoU.
+
+    Returns:
+        matched:    dict {face_index: fid}   — confirmed spatial matches
+        new_idxs:   list of face indices with no matching existing track
+        stale_fids: set of track IDs not matched to any current detection
+    """
+    if not tracks or not len(faces):
+        return {}, list(range(len(faces))), set(tracks.keys())
+
+    candidates = []
+    for fi, (fx, fy, fw, fh) in enumerate(faces):
+        face_box = (fx, fy, fx + fw, fy + fh)
+        for fid, person in tracks.items():
+            score = _iou(face_box, person.last_box)
+            if score >= iou_thresh:
+                candidates.append((score, fi, fid))
+
+    candidates.sort(key=lambda x: -x[0])
+    matched = {}
+    used_fids = set()
+    for score, fi, fid in candidates:
+        if fi not in matched and fid not in used_fids:
+            matched[fi] = fid
+            used_fids.add(fid)
+
+    new_idxs = [fi for fi in range(len(faces)) if fi not in matched]
+    stale_fids = set(tracks.keys()) - used_fids
+    return matched, new_idxs, stale_fids
 
 
 # ── Threaded Camera Buffer ───────────────────────────────
@@ -137,7 +188,11 @@ class CamBuffer:
                 time.sleep(2)
                 self._init_cam()
                 continue
-            ok, f = self.cap.read()
+            try:
+                ok, f = self.cap.read()
+            except Exception as e:
+                print(f"[WARN] Camera read failed: {e}", file=sys.stderr)
+                ok, f = False, None
             with self.lock:
                 self.ok, self.frame = ok, f
             if not ok:
@@ -200,6 +255,7 @@ def main():
         return
     cam = CamBuffer(0)
     tracks = {}
+    next_id = 0
     violations = 0
     overall_unsafe = False
     prev_t = time.perf_counter()
@@ -209,6 +265,7 @@ def main():
         while True:
             ok, frame = cam.read()
             if not ok or frame is None:
+                time.sleep(0.005)  # avoid CPU spin while camera isn't ready
                 continue
 
             # Periodically save raw frames for training data
@@ -234,19 +291,32 @@ def main():
                 g_boxes = infer_tflite(engine, in_idx, out_idx, frame_rgb, imgsz, MIN_CONF)
 
             cur_unsafe = False
-            active_ids = set()
-            for i, (fx, fy, fw, fh) in enumerate(faces):
-                fid = f"P_{i+1}"
-                active_ids.add(fid)
-                if fid not in tracks:
-                    tracks[fid] = TrackedPerson()
 
-                # Check if glasses bbox center falls inside this face
-                has_glasses = any(
-                    fx < (gx[0] + gx[2]) / 2 < fx + fw and fy < (gx[1] + gx[3]) / 2 < fy + fh
-                    for gx in g_boxes
-                )
-                tracks[fid].update(has_glasses)
+            # --- Identity tracking: match detections to existing tracks by IoU ---
+            matched, new_idxs, stale_fids = match_tracks(tracks, faces)
+
+            # Drop tracks whose face has disappeared
+            for fid in stale_fids:
+                del tracks[fid]
+
+            # Allocate new stable IDs for unmatched detections
+            for fi in new_idxs:
+                next_id += 1
+                fid = f"P{next_id}"
+                matched[fi] = fid
+                fx, fy, fw, fh = faces[fi]
+                tracks[fid] = TrackedPerson((fx, fy, fx + fw, fy + fh))
+
+            for fi, (fx, fy, fw, fh) in enumerate(faces):
+                fid = matched[fi]
+                face_box = (fx, fy, fx + fw, fy + fh)
+                has_glasses = False
+                for (gx1, gy1, gx2, gy2) in g_boxes:
+                    gcx, gcy = (gx1 + gx2) / 2, (gy1 + gy2) / 2
+                    if fx < gcx < fx + fw and fy < gcy < fy + fh:
+                        has_glasses = True
+                        break
+                tracks[fid].update(has_glasses, face_box)
                 col = COLOR_SAFE if tracks[fid].is_safe else COLOR_UNSAFE
                 if not tracks[fid].is_safe:
                     cur_unsafe = True
@@ -261,7 +331,6 @@ def main():
             if cur_unsafe and not overall_unsafe:
                 violations += 1
             overall_unsafe = cur_unsafe
-            tracks = {tid: t for tid, t in tracks.items() if tid in active_ids}
             fps = 1.0 / (time.perf_counter() - prev_t + 1e-9)
             prev_t = time.perf_counter()
             draw_hud(frame, overall_unsafe, fps, violations, len(faces), tag)

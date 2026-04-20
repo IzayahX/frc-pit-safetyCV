@@ -11,6 +11,7 @@ from tkinter import ttk
 import subprocess
 import os
 import sys
+import threading
 
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.env")
 MAIN_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pi_deploy.py")
@@ -205,9 +206,21 @@ class LauncherApp:
             self.root.after(100, self.poll_camera_once)
 
     def poll_camera_once(self):
+        """Start a background thread to detect the camera without blocking the UI."""
         self._poll_scheduled = False
-        idx, name = detect_working_camera()
 
+        def _detect():
+            idx, name = detect_working_camera()
+            # Always deliver the result back to the Tkinter main thread.
+            try:
+                self.root.after(0, lambda i=idx, n=name: self._on_camera_result(i, n))
+            except Exception:
+                pass  # window may have been destroyed
+
+        threading.Thread(target=_detect, daemon=True).start()
+
+    def _on_camera_result(self, idx, name):
+        """Called on the Tkinter main thread with the result of camera detection."""
         if idx is None:
             self.detected_camera = None
             self.camera_status.config(text="Waiting for camera… (USB / ribbon)", foreground="red")
