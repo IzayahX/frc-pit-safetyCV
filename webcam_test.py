@@ -214,9 +214,15 @@ def main():
             # Periodically save raw frames for training data
             now = time.perf_counter()
             if DATA_SAVE_INT > 0 and (now - last_data_t) >= DATA_SAVE_INT:
-                os.makedirs("data_collection", exist_ok=True)
-                cv2.imwrite(f"data_collection/sim_raw_{time.strftime('%H%M%S')}.jpg", frame)
                 last_data_t = now
+                try:
+                    os.makedirs("data_collection", exist_ok=True)
+                    if not cv2.imwrite(
+                        f"data_collection/sim_raw_{time.strftime('%H%M%S')}.jpg", frame
+                    ):
+                        print("[WARN] Failed to write training image (disk full or permissions issue?)", file=sys.stderr)
+                except OSError as e:
+                    print(f"[WARN] Could not save training image: {e}", file=sys.stderr)
 
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             faces = face_cascade.detectMultiScale(gray, 1.2, 5, minSize=(60, 60))

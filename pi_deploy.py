@@ -681,11 +681,16 @@ def main():
 
             now = time.perf_counter()
             if DATA_SAVE_INT > 0 and (now - last_data_t) >= DATA_SAVE_INT:
-                os.makedirs("data_collection", exist_ok=True)
-                ts = time.strftime("%Y%m%d_%H%M%S")
-                cv2.imwrite(f"data_collection/raw_{ts}.jpg", frame_bgr)
-                logger.info(f"Saved training image: raw_{ts}.jpg")
                 last_data_t = now
+                try:
+                    os.makedirs("data_collection", exist_ok=True)
+                    ts = time.strftime("%Y%m%d_%H%M%S")
+                    if cv2.imwrite(f"data_collection/raw_{ts}.jpg", frame_bgr):
+                        logger.info(f"Saved training image: raw_{ts}.jpg")
+                    else:
+                        logger.warning("Failed to write training image (disk full or permissions issue?)")
+                except OSError as e:
+                    logger.warning(f"Could not save training image: {e}")
 
             if frame_count % PROCESS_EVERY_N == 0:
                 gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
@@ -737,9 +742,15 @@ def main():
 
             if current_frame_unsafe and not overall_unsafe:
                 violations += 1
-                os.makedirs("violations", exist_ok=True)
-                cv2.imwrite(f"violations/pit_danger_{time.strftime('%H%M%S')}.jpg", frame_bgr)
                 logger.warning(f"Violation #{violations} detected")
+                try:
+                    os.makedirs("violations", exist_ok=True)
+                    if not cv2.imwrite(
+                        f"violations/pit_danger_{time.strftime('%H%M%S')}.jpg", frame_bgr
+                    ):
+                        logger.warning("Failed to write violation snapshot (disk full or permissions issue?)")
+                except OSError as e:
+                    logger.warning(f"Could not save violation snapshot: {e}")
 
             overall_unsafe = current_frame_unsafe
             tracks = {tid: t for tid, t in tracks.items() if tid in active_ids}
