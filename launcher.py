@@ -213,7 +213,7 @@ class LauncherApp:
             idx, name = detect_working_camera()
             # Always deliver the result back to the Tkinter main thread.
             try:
-                self.root.after(0, lambda: self._on_camera_result(idx, name))
+                self.root.after(0, lambda i=idx, n=name: self._on_camera_result(i, n))
             except Exception:
                 pass  # window may have been destroyed
 

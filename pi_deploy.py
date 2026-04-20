@@ -801,6 +801,7 @@ def main():
             current_frame_unsafe = False
             for fi, (fx, fy, fw, fh) in enumerate(faces):
                 fid = cached_matched.get(fi)
+                # Guard against cached_matched being stale (e.g. first few frames)
                 if fid is None or fid not in tracks:
                     continue
                 col = COLOR_SAFE if tracks[fid].is_safe else COLOR_UNSAFE
