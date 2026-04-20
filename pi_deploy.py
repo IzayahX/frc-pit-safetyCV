@@ -26,13 +26,42 @@ logging.basicConfig(
 logger = logging.getLogger("pit_safety")
 
 
+def _env_int(name: str, default: int, minimum=None):
+    raw = os.environ.get(name, str(default))
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        logger.warning(f"Invalid {name}={raw!r}; using {default}")
+        value = default
+    if minimum is not None and value < minimum:
+        logger.warning(f"{name}={value} is below minimum {minimum}; using {minimum}")
+        value = minimum
+    return value
+
+
+def _env_float(name: str, default: float, minimum=None, maximum=None):
+    raw = os.environ.get(name, str(default))
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        logger.warning(f"Invalid {name}={raw!r}; using {default}")
+        value = default
+    if minimum is not None and value < minimum:
+        logger.warning(f"{name}={value} is below minimum {minimum}; using {minimum}")
+        value = minimum
+    if maximum is not None and value > maximum:
+        logger.warning(f"{name}={value} is above maximum {maximum}; using {maximum}")
+        value = maximum
+    return value
+
+
 # ── Config (pulled from environment, set by launcher.py) ─
-CONFIRM_FRAMES = int(os.environ.get("CONFIRM_FRAMES", 8))
-MIN_CONF = float(os.environ.get("MIN_CONF", 0.70))
-CAM_RETRY_DELAY = int(os.environ.get("CAM_RETRY_DELAY", 5))
-DATA_SAVE_INT = float(os.environ.get("DATA_SAVE_INT", 0))
-PROCESS_EVERY_N = int(os.environ.get("PROCESS_EVERY_N", 2))
-TFLITE_THREADS = int(os.environ.get("TFLITE_THREADS", 2))
+CONFIRM_FRAMES = _env_int("CONFIRM_FRAMES", 8, minimum=1)
+MIN_CONF = _env_float("MIN_CONF", 0.70, minimum=0.0, maximum=1.0)
+CAM_RETRY_DELAY = _env_int("CAM_RETRY_DELAY", 5, minimum=1)
+DATA_SAVE_INT = _env_float("DATA_SAVE_INT", 0, minimum=0.0)
+PROCESS_EVERY_N = _env_int("PROCESS_EVERY_N", 2, minimum=1)
+TFLITE_THREADS = _env_int("TFLITE_THREADS", 2, minimum=1)
 MODEL_PATH = os.environ.get("MODEL_PATH", "")
 CAMERA_INDEX = os.environ.get("CAMERA_INDEX", "auto")
 FULLSCREEN = os.environ.get("FULLSCREEN", "1") == "1"
@@ -561,7 +590,11 @@ def main():
 
     model_path = MODEL_PATH
     if not model_path:
-        tflite_files = [f for f in os.listdir(".") if f.endswith(".tflite")]
+        try:
+            tflite_files = [f for f in os.listdir(".") if f.endswith(".tflite")]
+        except Exception as e:
+            logger.error(f"Failed to list model directory: {e}")
+            sys.exit(1)
         if not tflite_files:
             logger.error("No .tflite model found in current directory")
             sys.exit(1)
@@ -573,7 +606,13 @@ def main():
             camera_idx = 0
             logger.warning("No camera found at startup; will keep retrying")
     else:
-        camera_idx = int(CAMERA_INDEX)
+        try:
+            camera_idx = int(CAMERA_INDEX)
+        except (TypeError, ValueError):
+            logger.warning(f"Invalid CAMERA_INDEX={CAMERA_INDEX!r}; auto-detecting")
+            camera_idx = find_working_camera()
+            if camera_idx is None:
+                camera_idx = 0
 
     logger.info(f"Model: {model_path}")
     logger.info(
@@ -586,6 +625,10 @@ def main():
         logger.info(f"Training data collection: every {DATA_SAVE_INT}s -> data_collection/")
 
     face_cascade = cv2.CascadeClassifier(FACE_CASCADE_PATH)
+    if face_cascade.empty():
+        logger.error(f"Failed to load face cascade: {FACE_CASCADE_PATH}")
+        sys.exit(1)
+
     interp = load_interpreter(model_path, TFLITE_THREADS)
     in_det = interp.get_input_details()[0]
     out_det = interp.get_output_details()[0]
@@ -608,101 +651,116 @@ def main():
     else:
         logger.info("Main loop started — press 'q' to quit")
 
-    cv2.namedWindow(WIN_NAME, cv2.WINDOW_NORMAL)
+    try:
+        cv2.namedWindow(WIN_NAME, cv2.WINDOW_NORMAL)
+    except Exception as e:
+        logger.error(f"Failed to create display window: {e}")
+        cam.release()
+        sys.exit(1)
     fs_state = {"done": False}
 
-    while True:
-        ok, frame = cam.read()
-        if not ok or frame is None:
-            cv2.imshow(WIN_NAME, make_no_camera_slate())
-            apply_fullscreen_once(WIN_NAME, fs_state)
-            key = cv2.waitKey(30) & 0xFF
-            if not DEMO_MODE and key == ord("q"):
-                break
-            continue
-
-        frame_count += 1
-
-        if cam.is_rgb():
-            frame_rgb = frame
-            frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-        else:
-            frame_bgr = frame
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
-        now = time.perf_counter()
-        if DATA_SAVE_INT > 0 and (now - last_data_t) >= DATA_SAVE_INT:
-            os.makedirs("data_collection", exist_ok=True)
-            ts = time.strftime("%Y%m%d_%H%M%S")
-            cv2.imwrite(f"data_collection/raw_{ts}.jpg", frame_bgr)
-            logger.info(f"Saved training image: raw_{ts}.jpg")
-            last_data_t = now
-
-        if frame_count % PROCESS_EVERY_N == 0:
-            gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-            cached_faces = face_cascade.detectMultiScale(gray, 1.2, 5, minSize=(60, 60))
-            cached_g_boxes = infer(interp, in_det, out_det, frame_rgb, MIN_CONF)
-
-        faces = cached_faces
-        g_boxes = cached_g_boxes
-
-        current_frame_unsafe = False
-        active_ids = set()
-
-        for i, (fx, fy, fw, fh) in enumerate(faces):
-            fid = f"P_{i+1}"
-            active_ids.add(fid)
-            if fid not in tracks:
-                tracks[fid] = TrackedPerson()
-
-            has_glasses = False
-            for (gx1, gy1, gx2, gy2) in g_boxes:
-                gcx, gcy = (gx1 + gx2) / 2, (gy1 + gy2) / 2
-                if fx < gcx < fx + fw and fy < gcy < fy + fh:
-                    has_glasses = True
+    try:
+        while True:
+            ok, frame = cam.read()
+            if not ok or frame is None:
+                cv2.imshow(WIN_NAME, make_no_camera_slate())
+                apply_fullscreen_once(WIN_NAME, fs_state)
+                key = cv2.waitKey(30) & 0xFF
+                if not DEMO_MODE and key == ord("q"):
                     break
+                continue
 
-            tracks[fid].update(has_glasses)
-            col = COLOR_SAFE if tracks[fid].is_safe else COLOR_UNSAFE
-            if not tracks[fid].is_safe:
-                current_frame_unsafe = True
-                msg = "GLASSES REQUIRED"
-                (mw, _mh), _ = cv2.getTextSize(msg, cv2.FONT_HERSHEY_DUPLEX, 0.4, 1)
-                cv2.rectangle(frame_bgr, (fx, fy - 36), (fx + mw + 10, fy - 22), col, -1)
+            frame_count += 1
+
+            if cam.is_rgb():
+                frame_rgb = frame
+                frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            else:
+                frame_bgr = frame
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+            now = time.perf_counter()
+            if DATA_SAVE_INT > 0 and (now - last_data_t) >= DATA_SAVE_INT:
+                os.makedirs("data_collection", exist_ok=True)
+                ts = time.strftime("%Y%m%d_%H%M%S")
+                cv2.imwrite(f"data_collection/raw_{ts}.jpg", frame_bgr)
+                logger.info(f"Saved training image: raw_{ts}.jpg")
+                last_data_t = now
+
+            if frame_count % PROCESS_EVERY_N == 0:
+                gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+                cached_faces = face_cascade.detectMultiScale(gray, 1.2, 5, minSize=(60, 60))
+                cached_g_boxes = infer(interp, in_det, out_det, frame_rgb, MIN_CONF)
+
+            faces = cached_faces
+            g_boxes = cached_g_boxes
+
+            current_frame_unsafe = False
+            active_ids = set()
+
+            for i, (fx, fy, fw, fh) in enumerate(faces):
+                fid = f"P_{i+1}"
+                active_ids.add(fid)
+                if fid not in tracks:
+                    tracks[fid] = TrackedPerson()
+
+                has_glasses = False
+                for (gx1, gy1, gx2, gy2) in g_boxes:
+                    gcx, gcy = (gx1 + gx2) / 2, (gy1 + gy2) / 2
+                    if fx < gcx < fx + fw and fy < gcy < fy + fh:
+                        has_glasses = True
+                        break
+
+                tracks[fid].update(has_glasses)
+                col = COLOR_SAFE if tracks[fid].is_safe else COLOR_UNSAFE
+                if not tracks[fid].is_safe:
+                    current_frame_unsafe = True
+                    msg = "GLASSES REQUIRED"
+                    (mw, _mh), _ = cv2.getTextSize(msg, cv2.FONT_HERSHEY_DUPLEX, 0.4, 1)
+                    cv2.rectangle(frame_bgr, (fx, fy - 36), (fx + mw + 10, fy - 22), col, -1)
+                    cv2.putText(
+                        frame_bgr,
+                        msg,
+                        (fx + 5, fy - 24),
+                        cv2.FONT_HERSHEY_DUPLEX,
+                        0.4,
+                        WHITE,
+                        1,
+                        cv2.LINE_AA,
+                    )
+
+                cv2.rectangle(frame_bgr, (fx, fy), (fx + fw, fy + fh), col, 2)
+                cv2.rectangle(frame_bgr, (fx, fy - 22), (fx + 45, fy), col, -1)
                 cv2.putText(
-                    frame_bgr, msg, (fx + 5, fy - 24), cv2.FONT_HERSHEY_DUPLEX, 0.4, WHITE, 1, cv2.LINE_AA
+                    frame_bgr, fid, (fx + 5, fy - 7), cv2.FONT_HERSHEY_DUPLEX, 0.45, WHITE, 1, cv2.LINE_AA
                 )
 
-            cv2.rectangle(frame_bgr, (fx, fy), (fx + fw, fy + fh), col, 2)
-            cv2.rectangle(frame_bgr, (fx, fy - 22), (fx + 45, fy), col, -1)
-            cv2.putText(
-                frame_bgr, fid, (fx + 5, fy - 7), cv2.FONT_HERSHEY_DUPLEX, 0.45, WHITE, 1, cv2.LINE_AA
-            )
+            if current_frame_unsafe and not overall_unsafe:
+                violations += 1
+                os.makedirs("violations", exist_ok=True)
+                cv2.imwrite(f"violations/pit_danger_{time.strftime('%H%M%S')}.jpg", frame_bgr)
+                logger.warning(f"Violation #{violations} detected")
 
-        if current_frame_unsafe and not overall_unsafe:
-            violations += 1
-            os.makedirs("violations", exist_ok=True)
-            cv2.imwrite(f"violations/pit_danger_{time.strftime('%H%M%S')}.jpg", frame_bgr)
-            logger.warning(f"Violation #{violations} detected")
+            overall_unsafe = current_frame_unsafe
+            tracks = {tid: t for tid, t in tracks.items() if tid in active_ids}
 
-        overall_unsafe = current_frame_unsafe
-        tracks = {tid: t for tid, t in tracks.items() if tid in active_ids}
+            now = time.perf_counter()
+            fps = 1.0 / (now - prev_t + 1e-9)
+            prev_t = now
 
-        now = time.perf_counter()
-        fps = 1.0 / (now - prev_t + 1e-9)
-        prev_t = now
+            draw_hud(frame_bgr, overall_unsafe, fps, violations, len(faces), model_tag, DATA_SAVE_INT > 0)
+            cv2.imshow(WIN_NAME, frame_bgr)
+            apply_fullscreen_once(WIN_NAME, fs_state)
 
-        draw_hud(frame_bgr, overall_unsafe, fps, violations, len(faces), model_tag, DATA_SAVE_INT > 0)
-        cv2.imshow(WIN_NAME, frame_bgr)
-        apply_fullscreen_once(WIN_NAME, fs_state)
-
-        key = cv2.waitKey(1) & 0xFF
-        if not DEMO_MODE and key == ord("q"):
-            break
-
-    cam.release()
-    cv2.destroyAllWindows()
-    logger.info("Shutdown complete")
+            key = cv2.waitKey(1) & 0xFF
+            if not DEMO_MODE and key == ord("q"):
+                break
+    except Exception as e:
+        logger.exception(f"Fatal runtime error in main loop: {e}")
+    finally:
+        cam.release()
+        cv2.destroyAllWindows()
+        logger.info("Shutdown complete")
 
 
 if __name__ == "__main__":

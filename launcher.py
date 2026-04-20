@@ -32,7 +32,10 @@ def detect_working_camera():
         pass
 
     # Try USB cameras 0-4
-    import cv2
+    try:
+        import cv2
+    except Exception:
+        return None, None
     for i in range(5):
         try:
             cap = cv2.VideoCapture(i)
@@ -63,12 +66,15 @@ def load_config():
     }
 
     if os.path.exists(CONFIG_FILE):
-        with open(CONFIG_FILE, "r") as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith("#") and "=" in line:
-                    key, value = line.split("=", 1)
-                    config[key.strip()] = value.strip()
+        try:
+            with open(CONFIG_FILE, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith("#") and "=" in line:
+                        key, value = line.split("=", 1)
+                        config[key.strip()] = value.strip()
+        except Exception as e:
+            print(f"[LAUNCHER] Failed to read config.env: {e}", file=sys.stderr)
 
     return config
 
@@ -133,6 +139,28 @@ class LauncherApp:
 
         self.schedule_camera_poll()
         self._setup_autosave_hooks()
+
+    @staticmethod
+    def _safe_int(raw, default, minimum=None):
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            value = default
+        if minimum is not None:
+            value = max(minimum, value)
+        return value
+
+    @staticmethod
+    def _safe_float(raw, default, minimum=None, maximum=None):
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            value = default
+        if minimum is not None:
+            value = max(minimum, value)
+        if maximum is not None:
+            value = min(maximum, value)
+        return value
 
     # ── Autosave on change (debounced) ───────────────────
     def _setup_autosave_hooks(self):
@@ -221,7 +249,9 @@ class LauncherApp:
             row=1, column=0, sticky="w", pady=(15, 5))
         frame_skip_frame = ttk.Frame(main_frame)
         frame_skip_frame.grid(row=1, column=1, sticky="w", padx=(10, 0), pady=(15, 5))
-        self.frame_skip_var = tk.IntVar(value=int(self.config.get("PROCESS_EVERY_N", 2)))
+        self.frame_skip_var = tk.IntVar(
+            value=self._safe_int(self.config.get("PROCESS_EVERY_N", 2), 2, minimum=1)
+        )
         self.frame_skip_scale = ttk.Scale(
             frame_skip_frame, from_=1, to=5, variable=self.frame_skip_var,
             orient="horizontal", length=150,
@@ -237,7 +267,9 @@ class LauncherApp:
             row=3, column=0, sticky="w", pady=(15, 5))
         conf_frame = ttk.Frame(main_frame)
         conf_frame.grid(row=3, column=1, sticky="w", padx=(10, 0), pady=(15, 5))
-        self.conf_var = tk.DoubleVar(value=float(self.config.get("MIN_CONF", 0.70)))
+        self.conf_var = tk.DoubleVar(
+            value=self._safe_float(self.config.get("MIN_CONF", 0.70), 0.70, minimum=0.3, maximum=0.9)
+        )
         self.conf_scale = ttk.Scale(
             conf_frame, from_=0.3, to=0.9, variable=self.conf_var,
             orient="horizontal", length=150,
@@ -253,7 +285,9 @@ class LauncherApp:
             row=5, column=0, sticky="w", pady=(15, 5))
         confirm_frame = ttk.Frame(main_frame)
         confirm_frame.grid(row=5, column=1, sticky="w", padx=(10, 0), pady=(15, 5))
-        self.confirm_var = tk.IntVar(value=int(self.config.get("CONFIRM_FRAMES", 8)))
+        self.confirm_var = tk.IntVar(
+            value=self._safe_int(self.config.get("CONFIRM_FRAMES", 8), 8, minimum=3)
+        )
         self.confirm_scale = ttk.Scale(
             confirm_frame, from_=3, to=20, variable=self.confirm_var,
             orient="horizontal", length=150,
@@ -272,7 +306,7 @@ class LauncherApp:
             row=8, column=0, sticky="w", pady=(5, 5))
         data_frame = ttk.Frame(main_frame)
         data_frame.grid(row=8, column=1, sticky="w", padx=(10, 0), pady=(5, 5))
-        current_interval = float(self.config.get("DATA_SAVE_INT", 0))
+        current_interval = self._safe_float(self.config.get("DATA_SAVE_INT", 0), 0, minimum=0)
         self.data_enabled_var = tk.BooleanVar(value=current_interval > 0)
         self.data_check = ttk.Checkbutton(
             data_frame, text="Save raw images every",
@@ -377,7 +411,13 @@ class LauncherApp:
             return
 
         self.countdown_active = False
-        config = self.save_and_get_config()
+        try:
+            config = self.save_and_get_config()
+        except Exception as e:
+            self.countdown_label.config(text=f"Failed to save config: {e}", fg="red")
+            self._handoff_armed = False
+            self.root.after(CAMERA_POLL_MS, self.poll_camera_once)
+            return
 
         self.countdown_label.config(text="Starting monitor…", fg="green")
         self.root.update()

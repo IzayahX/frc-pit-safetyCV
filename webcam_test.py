@@ -28,11 +28,15 @@ def load_onnx(model_path):
     opts.intra_op_num_threads = multiprocessing.cpu_count()
     available = rt.get_available_providers()
     providers = [p for p in ["CUDAExecutionProvider", "DmlExecutionProvider", "CPUExecutionProvider"] if p in available]
-    session = rt.InferenceSession(model_path, sess_options=opts, providers=providers)
+    if providers:
+        session = rt.InferenceSession(model_path, sess_options=opts, providers=providers)
+    else:
+        session = rt.InferenceSession(model_path, sess_options=opts)
     in_n = session.get_inputs()[0].name
     out_n = session.get_outputs()[0].name
     imgsz = session.get_inputs()[0].shape[2] if isinstance(session.get_inputs()[0].shape[2], int) else 416
-    return session, in_n, out_n, imgsz, f"ONNX ({providers[0]})"
+    provider_name = providers[0] if providers else "DefaultProvider"
+    return session, in_n, out_n, imgsz, f"ONNX ({provider_name})"
 
 
 def load_tflite(model_path):
@@ -145,7 +149,8 @@ class CamBuffer:
 
     def release(self):
         self.alive = False
-        self.cap.release()
+        if self.cap:
+            self.cap.release()
 
 
 # ── HUD ──────────────────────────────────────────────────
@@ -173,16 +178,26 @@ def main():
     print("\n[Simulator] Select Inference Engine:")
     print("1. ONNX (best.onnx) — optimized for laptop")
     print("2. TFLite (best_int8.tflite) — simulates Pi behavior")
-    choice = input("Choice [1/2] (default 1): ").strip()
+    try:
+        choice = input("Choice [1/2] (default 1): ").strip()
+    except EOFError:
+        choice = ""
 
-    if choice == "2":
-        engine, in_idx, out_idx, imgsz, tag = load_tflite("best_int8.tflite")
-        engine_type = "TFLITE"
-    else:
-        engine, in_idx, out_idx, imgsz, tag = load_onnx("best.onnx")
-        engine_type = "ONNX"
+    try:
+        if choice == "2":
+            engine, in_idx, out_idx, imgsz, tag = load_tflite("best_int8.tflite")
+            engine_type = "TFLITE"
+        else:
+            engine, in_idx, out_idx, imgsz, tag = load_onnx("best.onnx")
+            engine_type = "ONNX"
+    except Exception as e:
+        print(f"[ERR] Failed to load inference engine: {e}", file=sys.stderr)
+        return
 
     face_cascade = cv2.CascadeClassifier(FACE_CASCADE_PATH)
+    if face_cascade.empty():
+        print(f"[ERR] Failed to load face cascade: {FACE_CASCADE_PATH}", file=sys.stderr)
+        return
     cam = CamBuffer(0)
     tracks = {}
     violations = 0
@@ -190,65 +205,68 @@ def main():
     prev_t = time.perf_counter()
     last_data_t = prev_t
 
-    while True:
-        ok, frame = cam.read()
-        if not ok or frame is None:
-            continue
+    try:
+        while True:
+            ok, frame = cam.read()
+            if not ok or frame is None:
+                continue
 
-        # Periodically save raw frames for training data
-        now = time.perf_counter()
-        if DATA_SAVE_INT > 0 and (now - last_data_t) >= DATA_SAVE_INT:
-            os.makedirs("data_collection", exist_ok=True)
-            cv2.imwrite(f"data_collection/sim_raw_{time.strftime('%H%M%S')}.jpg", frame)
-            last_data_t = now
+            # Periodically save raw frames for training data
+            now = time.perf_counter()
+            if DATA_SAVE_INT > 0 and (now - last_data_t) >= DATA_SAVE_INT:
+                os.makedirs("data_collection", exist_ok=True)
+                cv2.imwrite(f"data_collection/sim_raw_{time.strftime('%H%M%S')}.jpg", frame)
+                last_data_t = now
 
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        faces = face_cascade.detectMultiScale(gray, 1.2, 5, minSize=(60, 60))
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            faces = face_cascade.detectMultiScale(gray, 1.2, 5, minSize=(60, 60))
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-        if engine_type == "ONNX":
-            g_boxes = infer_onnx(engine, in_idx, out_idx, frame_rgb, imgsz, MIN_CONF)
-        else:
-            g_boxes = infer_tflite(engine, in_idx, out_idx, frame_rgb, imgsz, MIN_CONF)
+            if engine_type == "ONNX":
+                g_boxes = infer_onnx(engine, in_idx, out_idx, frame_rgb, imgsz, MIN_CONF)
+            else:
+                g_boxes = infer_tflite(engine, in_idx, out_idx, frame_rgb, imgsz, MIN_CONF)
 
-        cur_unsafe = False
-        active_ids = set()
-        for i, (fx, fy, fw, fh) in enumerate(faces):
-            fid = f"P_{i+1}"
-            active_ids.add(fid)
-            if fid not in tracks:
-                tracks[fid] = TrackedPerson()
+            cur_unsafe = False
+            active_ids = set()
+            for i, (fx, fy, fw, fh) in enumerate(faces):
+                fid = f"P_{i+1}"
+                active_ids.add(fid)
+                if fid not in tracks:
+                    tracks[fid] = TrackedPerson()
 
-            # Check if glasses bbox center falls inside this face
-            has_glasses = any(
-                fx < (gx[0]+gx[2])/2 < fx+fw and fy < (gx[1]+gx[3])/2 < fy+fh
-                for gx in g_boxes
-            )
-            tracks[fid].update(has_glasses)
-            col = COLOR_SAFE if tracks[fid].is_safe else COLOR_UNSAFE
-            if not tracks[fid].is_safe:
-                cur_unsafe = True
-                msg = "GLASSES REQUIRED"
-                (mw, mh), _ = cv2.getTextSize(msg, 1, 0.9, 1)
-                cv2.rectangle(frame, (fx, fy - 35), (fx + mw + 10, fy - 15), col, -1)
-                cv2.putText(frame, msg, (fx + 5, fy - 17), 1, 0.9, WHITE, 1)
-            cv2.rectangle(frame, (fx, fy), (fx+fw, fy+fh), col, 2)
-            cv2.rectangle(frame, (fx, fy-22), (fx+45, fy), col, -1)
-            cv2.putText(frame, fid, (fx+5, fy-7), 1, 1, WHITE, 1)
+                # Check if glasses bbox center falls inside this face
+                has_glasses = any(
+                    fx < (gx[0] + gx[2]) / 2 < fx + fw and fy < (gx[1] + gx[3]) / 2 < fy + fh
+                    for gx in g_boxes
+                )
+                tracks[fid].update(has_glasses)
+                col = COLOR_SAFE if tracks[fid].is_safe else COLOR_UNSAFE
+                if not tracks[fid].is_safe:
+                    cur_unsafe = True
+                    msg = "GLASSES REQUIRED"
+                    (mw, mh), _ = cv2.getTextSize(msg, 1, 0.9, 1)
+                    cv2.rectangle(frame, (fx, fy - 35), (fx + mw + 10, fy - 15), col, -1)
+                    cv2.putText(frame, msg, (fx + 5, fy - 17), 1, 0.9, WHITE, 1)
+                cv2.rectangle(frame, (fx, fy), (fx + fw, fy + fh), col, 2)
+                cv2.rectangle(frame, (fx, fy - 22), (fx + 45, fy), col, -1)
+                cv2.putText(frame, fid, (fx + 5, fy - 7), 1, 1, WHITE, 1)
 
-        if cur_unsafe and not overall_unsafe:
-            violations += 1
-        overall_unsafe = cur_unsafe
-        tracks = {tid: t for tid, t in tracks.items() if tid in active_ids}
-        fps = 1.0 / (time.perf_counter() - prev_t + 1e-9)
-        prev_t = time.perf_counter()
-        draw_hud(frame, overall_unsafe, fps, violations, len(faces), tag)
-        cv2.imshow("FRC Pit SIMULATOR", frame)
-        if cv2.waitKey(1) & 0xFF == ord("q"):
-            break
-
-    cam.release()
-    cv2.destroyAllWindows()
+            if cur_unsafe and not overall_unsafe:
+                violations += 1
+            overall_unsafe = cur_unsafe
+            tracks = {tid: t for tid, t in tracks.items() if tid in active_ids}
+            fps = 1.0 / (time.perf_counter() - prev_t + 1e-9)
+            prev_t = time.perf_counter()
+            draw_hud(frame, overall_unsafe, fps, violations, len(faces), tag)
+            cv2.imshow("FRC Pit SIMULATOR", frame)
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                break
+    except Exception as e:
+        print(f"[ERR] Runtime failure: {e}", file=sys.stderr)
+    finally:
+        cam.release()
+        cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":
