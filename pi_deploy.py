@@ -295,6 +295,14 @@ def infer(interp, input_detail: dict, output_detail: dict, frame_rgb: np.ndarray
     if hasattr(preds, "shape") and len(preds.shape) == 2 and preds.shape[0] < preds.shape[1]:
         preds = preds.T
 
+    # Validate output: must be 2-D with at least [cx, cy, w, h, conf] columns
+    if not isinstance(preds, np.ndarray) or preds.ndim != 2 or preds.shape[1] < 5:
+        logger.warning(
+            "Unexpected model output shape: %s; expected (N, >=5). Skipping frame.",
+            getattr(preds, "shape", type(preds)),
+        )
+        return []
+
     confs = preds[:, 4].astype(np.float32)
     if confs.size and confs.max() > 1.0:
         confs /= 255.0
@@ -346,11 +354,13 @@ def infer(interp, input_detail: dict, output_detail: dict, frame_rgb: np.ndarray
 class TrackedPerson:
     """Tracks consecutive frames without glasses to confirm a violation."""
 
-    def __init__(self):
+    def __init__(self, box):
         self.streak = 0
         self.is_safe = True
+        self.last_box = box  # (x1, y1, x2, y2) in frame coords
 
-    def update(self, has_glasses):
+    def update(self, has_glasses, box):
+        self.last_box = box
         if has_glasses:
             self.streak = max(0, self.streak - 1)
             if self.streak == 0:
@@ -359,6 +369,61 @@ class TrackedPerson:
             self.streak += 1
             if self.streak >= CONFIRM_FRAMES:
                 self.is_safe = False
+
+
+# ── IoU / Track Matching Helpers ─────────────────────────
+def _iou(a, b):
+    """Intersection-over-Union for two (x1, y1, x2, y2) boxes."""
+    ix1 = max(a[0], b[0])
+    iy1 = max(a[1], b[1])
+    ix2 = min(a[2], b[2])
+    iy2 = min(a[3], b[3])
+    inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+    if inter == 0:
+        return 0.0
+    area_a = max(0, a[2] - a[0]) * max(0, a[3] - a[1])
+    area_b = max(0, b[2] - b[0]) * max(0, b[3] - b[1])
+    union = area_a + area_b - inter
+    return inter / union if union > 0 else 0.0
+
+
+def match_tracks(tracks, faces, iou_thresh=0.30):
+    """
+    Spatially match current face detections to existing track IDs by IoU.
+
+    Args:
+        tracks:     dict {fid: TrackedPerson}  (each has .last_box)
+        faces:      sequence of (x, y, w, h) from detectMultiScale
+        iou_thresh: minimum IoU score to accept a match
+
+    Returns:
+        matched:    dict {face_index: fid}   — confirmed spatial matches
+        new_idxs:   list of face indices with no matching existing track
+        stale_fids: set of track IDs not matched to any current detection
+    """
+    if not tracks or not len(faces):
+        return {}, list(range(len(faces))), set(tracks.keys())
+
+    candidates = []
+    for fi, (fx, fy, fw, fh) in enumerate(faces):
+        face_box = (fx, fy, fx + fw, fy + fh)
+        for fid, person in tracks.items():
+            score = _iou(face_box, person.last_box)
+            if score >= iou_thresh:
+                candidates.append((score, fi, fid))
+
+    # Greedy assignment: highest IoU pairs first
+    candidates.sort(key=lambda x: -x[0])
+    matched = {}
+    used_fids = set()
+    for score, fi, fid in candidates:
+        if fi not in matched and fid not in used_fids:
+            matched[fi] = fid
+            used_fids.add(fid)
+
+    new_idxs = [fi for fi in range(len(faces)) if fi not in matched]
+    stale_fids = set(tracks.keys()) - used_fids
+    return matched, new_idxs, stale_fids
 
 
 # ── Camera Auto-Detection ────────────────────────────────
@@ -638,6 +703,7 @@ def main():
     cam = CamBuffer(idx=max(0, camera_idx), use_picamera=use_picam if use_picam else None)
 
     tracks = {}
+    next_id = 0
     violations = 0
     overall_unsafe = False
     prev_t = time.perf_counter()
@@ -645,6 +711,7 @@ def main():
     frame_count = 0
     cached_faces = []
     cached_g_boxes = []
+    cached_matched = {}  # face_index -> fid; kept in sync with cached_faces
 
     if DEMO_MODE:
         logger.info("Main loop started (DEMO_MODE: quit key disabled)")
@@ -694,29 +761,48 @@ def main():
 
             if frame_count % PROCESS_EVERY_N == 0:
                 gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-                cached_faces = face_cascade.detectMultiScale(gray, 1.2, 5, minSize=(60, 60))
-                cached_g_boxes = infer(interp, in_det, out_det, frame_rgb, MIN_CONF)
+                new_faces = face_cascade.detectMultiScale(gray, 1.2, 5, minSize=(60, 60))
+                new_g_boxes = infer(interp, in_det, out_det, frame_rgb, MIN_CONF)
+
+                # --- Identity tracking: match detections to existing tracks by IoU ---
+                matched, new_idxs, stale_fids = match_tracks(tracks, new_faces)
+
+                # Drop tracks whose face has disappeared
+                for fid in stale_fids:
+                    del tracks[fid]
+
+                # Allocate new stable IDs for unmatched detections
+                for fi in new_idxs:
+                    next_id += 1
+                    fid = f"P{next_id}"
+                    matched[fi] = fid
+                    fx, fy, fw, fh = new_faces[fi]
+                    tracks[fid] = TrackedPerson((fx, fy, fx + fw, fy + fh))
+
+                # Update each track's state (streak + last_box) exactly once per inference
+                for fi, (fx, fy, fw, fh) in enumerate(new_faces):
+                    fid = matched[fi]
+                    face_box = (fx, fy, fx + fw, fy + fh)
+                    has_glasses = False
+                    for (gx1, gy1, gx2, gy2) in new_g_boxes:
+                        gcx, gcy = (gx1 + gx2) / 2, (gy1 + gy2) / 2
+                        if fx < gcx < fx + fw and fy < gcy < fy + fh:
+                            has_glasses = True
+                            break
+                    tracks[fid].update(has_glasses, face_box)
+
+                cached_faces = new_faces
+                cached_g_boxes = new_g_boxes
+                cached_matched = matched
 
             faces = cached_faces
             g_boxes = cached_g_boxes
 
             current_frame_unsafe = False
-            active_ids = set()
-
-            for i, (fx, fy, fw, fh) in enumerate(faces):
-                fid = f"P_{i+1}"
-                active_ids.add(fid)
-                if fid not in tracks:
-                    tracks[fid] = TrackedPerson()
-
-                has_glasses = False
-                for (gx1, gy1, gx2, gy2) in g_boxes:
-                    gcx, gcy = (gx1 + gx2) / 2, (gy1 + gy2) / 2
-                    if fx < gcx < fx + fw and fy < gcy < fy + fh:
-                        has_glasses = True
-                        break
-
-                tracks[fid].update(has_glasses)
+            for fi, (fx, fy, fw, fh) in enumerate(faces):
+                fid = cached_matched.get(fi)
+                if fid is None or fid not in tracks:
+                    continue
                 col = COLOR_SAFE if tracks[fid].is_safe else COLOR_UNSAFE
                 if not tracks[fid].is_safe:
                     current_frame_unsafe = True
@@ -753,7 +839,6 @@ def main():
                     logger.warning(f"Could not save violation snapshot: {e}")
 
             overall_unsafe = current_frame_unsafe
-            tracks = {tid: t for tid, t in tracks.items() if tid in active_ids}
 
             now = time.perf_counter()
             fps = 1.0 / (now - prev_t + 1e-9)
